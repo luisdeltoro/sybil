@@ -1,0 +1,11 @@
+[project]
+name = "extract-speech"
+version = "0.1.0"
+description = "Transcribe speech from noisy video/audio files using Whisper with noise reduction"
+requires-python = ">=3.10"
+dependencies = [
+    "openai-whisper",
+    "noisereduce",
+    "soundfile",
+    "numpy",
+]
