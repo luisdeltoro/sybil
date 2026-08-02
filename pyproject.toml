@@ -8,4 +8,6 @@ dependencies = [
     "noisereduce",
     "soundfile",
     "numpy",
+    "demucs>=4.0.1",
+    "torchcodec>=0.13.0",
 ]

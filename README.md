@@ -1,6 +1,6 @@
 # extract_speech
 
-Transcribe speech from noisy video/audio files using OpenAI Whisper with noise reduction.
+Transcribe speech from noisy video/audio files using OpenAI Whisper with configurable noise reduction.
 
 ## Prerequisites
 
@@ -23,17 +23,21 @@ No manual installation needed. `uv run` handles the isolated environment and dep
 ```bash
 cd extract_speech
 
-# Basic usage (Spanish audio, medium model)
+# Basic usage (Spanish audio, medium model, loudnorm denoising)
 uv run python transcribe.py /path/to/video.mp4
 
 # Use a larger model for better accuracy (slower, needs ~10GB RAM)
 uv run python transcribe.py /path/to/video.mp4 --model large
 
+# Choose a different noise reduction method
+uv run python transcribe.py /path/to/video.mp4 --denoise spectral
+uv run python transcribe.py /path/to/video.mp4 --denoise ffmpeg
+
+# Skip noise reduction entirely (if audio is already clean)
+uv run python transcribe.py /path/to/video.mp4 --no-denoise
+
 # Save output to a file
 uv run python transcribe.py /path/to/video.mp4 --output transcript.txt
-
-# Skip noise reduction (if audio is already clean)
-uv run python transcribe.py /path/to/video.mp4 --no-denoise
 
 # Transcribe in a different language
 uv run python transcribe.py /path/to/video.mp4 --language en
@@ -47,7 +51,23 @@ uv run python transcribe.py /path/to/video.mp4 --language en
 | `--model` | `medium` | Whisper model: `tiny`, `base`, `small`, `medium`, `large` |
 | `--language` | `es` | Language code (e.g., `es`, `en`, `fr`, `de`) |
 | `--output` / `-o` | stdout | Save transcript to a text file |
-| `--no-denoise` | off | Skip the noise reduction step |
+| `--denoise` | `loudnorm` | Noise reduction method: `loudnorm`, `spectral`, `ffmpeg` |
+| `--no-denoise` | off | Skip noise reduction entirely |
+
+## Noise Reduction Methods
+
+| Method | Best For | How It Works |
+|--------|----------|--------------|
+| `loudnorm` (default) | Faint voices buried in noise | EBU R128 loudness normalization. Boosts quiet speech to broadcast level without aggressive filtering that might remove speech. |
+| `spectral` | Constant background noise (fans, hum, hiss) | Spectral gating via `noisereduce`. Estimates noise profile and subtracts it. Can be too aggressive on very noisy audio. |
+| `ffmpeg` | Broadband noise with speech in mid frequencies | Bandpass filter (300-3500 Hz) + FFT denoise + dynamic normalization. Isolates speech frequencies and boosts quiet passages. |
+
+### When to use which
+
+- **Start with `loudnorm`** (default) - works best for most noisy recordings where speech is faint.
+- **Try `spectral`** if there's a constant drone/hum you want removed (e.g., air conditioning, electrical hum).
+- **Try `ffmpeg`** if there's lots of low-frequency rumble or high-frequency hiss and speech is in the middle.
+- **Use `--no-denoise`** if the audio is already clean or if all methods make it worse.
 
 ## Model Recommendations
 
@@ -72,12 +92,13 @@ Transcript is output with timestamps per segment:
 ## How It Works
 
 1. **Audio extraction** - ffmpeg extracts audio from the input file as 16kHz mono WAV
-2. **Noise reduction** - `noisereduce` applies spectral gating to suppress stationary background noise (fans, hum, traffic)
-3. **Transcription** - OpenAI Whisper processes the cleaned audio and outputs timestamped text segments
+2. **Noise reduction** - Configurable method processes the audio to improve speech clarity
+3. **Transcription** - OpenAI Whisper processes the audio with tuned parameters (beam search, temperature fallback, hallucination prevention) and outputs timestamped text segments
 
 ## Troubleshooting
 
 - **"ffmpeg not found"** - Install with `brew install ffmpeg`
 - **Out of memory** - Use a smaller model: `--model small` or `--model tiny`
 - **Poor accuracy** - Try `--model large`, or ensure `--language es` matches the spoken language
-- **Noise reduction making it worse** - Try `--no-denoise` if the audio has non-stationary noise (e.g., music, multiple overlapping sounds)
+- **Hallucinations (repeated words like "Gracias", "Si, si")** - The audio SNR is too low. Try `--model large` and different `--denoise` methods, or accept that the audio may be too noisy for reliable transcription.
+- **Noise reduction removing speech** - Try `--denoise loudnorm` (gentlest) or `--no-denoise`
