@@ -1,7 +1,7 @@
 [project]
 name = "extract-speech"
-version = "0.1.0"
-description = "Transcribe speech from noisy video/audio files using Whisper with noise reduction"
+version = "0.2.0"
+description = "Transcribe and diarize speech from video/audio files using Whisper + pyannote"
 requires-python = ">=3.10"
 dependencies = [
     "openai-whisper",
@@ -10,4 +10,22 @@ dependencies = [
     "numpy",
     "demucs>=4.0.1",
     "torchcodec>=0.13.0",
+    "pyannote.audio>=4.0",
 ]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
