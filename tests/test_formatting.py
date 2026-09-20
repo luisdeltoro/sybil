@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from transcribe import Utterance, format_diarized, format_plain, format_timestamp
+from extract_speech.transcribe import Utterance, format_diarized, format_plain, format_timestamp
 
 
 def test_format_timestamp_zero():

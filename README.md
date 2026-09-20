@@ -1,13 +1,18 @@
-# extract_speech
+# extract-speech
 
 Transcribe **and diarize** speech from video/audio files, tagging each speaker
 as `Persona 1`, `Persona 2`, … Uses `ffmpeg` for audio extraction, OpenAI
 **Whisper** for transcription, and **pyannote.audio** for speaker diarization —
 all running locally after the models are downloaded.
 
+> The GitHub repo and directory are named `sybil`; the installed command and
+> distribution are `extract-speech`, and the import package is `extract_speech`.
+> The names differ deliberately: `sybil` is an unrelated, actively maintained
+> package on PyPI.
+
 ## Prerequisites
 
-- **Python 3.10+**
+- **Python 3.12+**
 - **[uv](https://docs.astral.sh/uv/)** — Python package manager
 - **ffmpeg** — audio extraction (also required by pyannote's audio decoding)
 - A **HuggingFace token** — required only for diarization (see below)
@@ -21,10 +26,10 @@ curl -LsSf https://astral.sh/uv/install.sh | sh   # if uv is not installed
 ## Setup
 
 ```bash
-cd extract_speech
-uv pip install -e .          # runtime deps
-uv pip install -e ".[dev]"   # + pytest and ruff (for development)
+make install     # creates .venv and installs runtime + dev dependencies
 ```
+
+Run `make help` to see every available target.
 
 ### HuggingFace token (for diarization)
 
@@ -45,7 +50,7 @@ export HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxx
 cp .env.example .env   # then edit .env and paste your token
 
 # Option C: pass it on the command line
-uv run python transcribe.py video.mp4 --hf-token hf_xxxx
+uv run extract-speech video.mp4 --hf-token hf_xxxx
 ```
 
 The `.env` file is listed in `.gitignore` and is never committed.
@@ -56,17 +61,17 @@ If you only want a plain transcript, use `--no-diarize` and no token is needed.
 
 ```bash
 # Clean phone call, diarized, Spanish — all defaults
-uv run python transcribe.py conversation.mp4
+uv run extract-speech conversation.mp4
 
 # Force the number of speakers (recommended for clean 2-person calls;
 # auto-detect can over-segment short backchannel utterances)
-uv run python transcribe.py conversation.mp4 --speakers 2
+uv run extract-speech conversation.mp4 --speakers 2
 
 # Noisy / far-field recording, force 3 speakers, save to file
-uv run python transcribe.py meeting.mp4 --profile noisy --speakers 3 -o out.txt
+uv run extract-speech meeting.mp4 --profile noisy --speakers 3 -o out.txt
 
 # Transcription only (no speaker tags), larger model, English
-uv run python transcribe.py talk.mp4 --no-diarize --whisper-model large --language en
+uv run extract-speech talk.mp4 --no-diarize --whisper-model large --language en
 ```
 
 ## CLI options
@@ -140,10 +145,15 @@ Plain (`--no-diarize`):
 ## Development
 
 ```bash
-PYTHONPATH=. uv run pytest        # run tests (fast; no models/network/audio)
-uv run ruff check .               # lint
-uv run ruff format .              # format
+make test         # run tests (fast; no models/network/audio)
+make lint         # ruff check
+make format       # ruff format
+make type-check   # pyright
+make check        # lint + type-check + tests, without rewriting files
+make all          # install + format + lint + type-check + test
 ```
+
+Layout: the package lives in `src/extract_speech/`, tests in `tests/`.
 
 The tests cover the pure logic — profile resolution and override precedence,
 speaker alignment (including the "speaker change inside one Whisper segment"

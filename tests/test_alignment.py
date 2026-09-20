@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from conftest import make_segment, make_word
 
-from transcribe import (
+from extract_speech.transcribe import (
     SpeakerTurn,
     build_speaker_map,
     group_words_by_speaker,

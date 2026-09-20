@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from transcribe import TranscriptionError, load_dotenv, resolve_hf_token
+from extract_speech.transcribe import TranscriptionError, load_dotenv, resolve_hf_token
 
 
 def test_load_dotenv_missing_file_is_noop(tmp_path):

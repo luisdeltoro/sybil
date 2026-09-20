@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from transcribe import (
+from extract_speech.transcribe import (
     PROFILES,
     ConfigOverrides,
     build_parser,

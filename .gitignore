@@ -1,13 +1,28 @@
 # Secrets / local config
 .env
 
-# Python
+# Environments
+.venv/
+
+# Byte-compiled / optimized
 __pycache__/
 *.py[cod]
-.venv/
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Tool caches
 .pytest_cache/
 .ruff_cache/
+.pyright/
+.mypy_cache/
 
 # Output / intermediate artifacts
 output/
 *.wav
+
+# OS files
+.DS_Store

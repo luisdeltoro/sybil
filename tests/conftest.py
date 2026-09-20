@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from transcribe import SpeakerTurn
+from extract_speech.transcribe import SpeakerTurn
 
 
 def make_word(word: str, start: float, end: float) -> dict:

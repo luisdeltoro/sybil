@@ -33,6 +33,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, cast
 
 # ---------------------------------------------------------------------------
 # Configuration model + profiles
@@ -123,12 +124,8 @@ def resolve_config(profile: str, overrides: ConfigOverrides) -> TranscribeConfig
 
     base = PROFILES[profile]
     return TranscribeConfig(
-        denoise_enabled=(
-            base.denoise_enabled if overrides.denoise_enabled is None else overrides.denoise_enabled
-        ),
-        denoise_method=(
-            base.denoise_method if overrides.denoise_method is None else overrides.denoise_method
-        ),
+        denoise_enabled=(base.denoise_enabled if overrides.denoise_enabled is None else overrides.denoise_enabled),
+        denoise_method=(base.denoise_method if overrides.denoise_method is None else overrides.denoise_method),
         temperature=base.temperature,
         no_speech_threshold=base.no_speech_threshold,
         condition_on_previous_text=(
@@ -325,7 +322,9 @@ def transcribe_audio(
         word_timestamps=word_timestamps,
         verbose=False,
     )
-    return result["segments"]
+    # Whisper annotates its return as dict[str, str | list], so indexing it
+    # widens to "str | list". "segments" is always a list of segment dicts.
+    return cast("list[dict]", result["segments"])
 
 
 # ---------------------------------------------------------------------------
@@ -348,9 +347,7 @@ def diarize_audio(audio_path: Path, hf_token: str, num_speakers: int | None) -> 
 
     print("Loading pyannote diarization pipeline (community-1)...")
     try:
-        pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-community-1", token=hf_token
-        )
+        pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-community-1", token=hf_token)
     except Exception as exc:  # noqa: BLE001 - surface a clear, actionable error
         raise TranscriptionError(
             "Failed to load pyannote pipeline. Ensure your HF token is valid and "
@@ -358,6 +355,17 @@ def diarize_audio(audio_path: Path, hf_token: str, num_speakers: int | None) -> 
             "https://hf.co/pyannote/speaker-diarization-community-1\n"
             f"Underlying error: {exc}"
         ) from exc
+
+    # from_pretrained returns Optional[Pipeline]: it yields None (rather than
+    # raising) when the checkpoint cannot be resolved, e.g. the model conditions
+    # have not been accepted for this token.
+    if pipeline is None:
+        raise TranscriptionError(
+            "pyannote returned no pipeline for 'pyannote/speaker-diarization-community-1'. "
+            "This usually means the token lacks access: accept the model conditions at "
+            "https://hf.co/pyannote/speaker-diarization-community-1 and "
+            "https://hf.co/pyannote/segmentation-3.0, then retry."
+        )
 
     device = "mps" if torch.backends.mps.is_available() else "cpu"
     try:
@@ -371,7 +379,10 @@ def diarize_audio(audio_path: Path, hf_token: str, num_speakers: int | None) -> 
     if num_speakers is not None:
         kwargs["num_speakers"] = num_speakers
     with ProgressHook() as hook:
-        output = pipeline(str(audio_path), hook=hook, **kwargs)
+        # Pipeline.__call__ is annotated "Any | Iterator[tuple[Any, Any]]", which
+        # carries no usable information. community-1 returns a result object
+        # exposing .speaker_diarization; treat it as untyped rather than pretend.
+        output: Any = pipeline(str(audio_path), hook=hook, **kwargs)
 
     return [
         SpeakerTurn(start=segment.start, end=segment.end, speaker=label)
@@ -504,9 +515,7 @@ def format_plain(segments: list[dict]) -> str:
 
 def format_diarized(utterances: list[Utterance]) -> str:
     """Format diarized utterances as ``[HH:MM:SS] Persona N: text``."""
-    return "\n".join(
-        f"[{format_timestamp(u.start)}] Persona {u.speaker}: {u.text}" for u in utterances
-    )
+    return "\n".join(f"[{format_timestamp(u.start)}] Persona {u.speaker}: {u.text}" for u in utterances)
 
 
 # ---------------------------------------------------------------------------

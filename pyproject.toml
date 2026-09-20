@@ -1,8 +1,12 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "extract-speech"
 version = "0.2.0"
 description = "Transcribe and diarize speech from video/audio files using Whisper + pyannote"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "openai-whisper",
     "noisereduce",
@@ -13,19 +17,51 @@ dependencies = [
     "pyannote.audio>=4.0",
 ]
 
-[project.optional-dependencies]
+[project.scripts]
+extract-speech = "extract_speech.transcribe:main"
+
+[dependency-groups]
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",
+    "pyright>=1.1.0",
 ]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/extract_speech"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # Pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "SIM",  # flake8-simplify
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+
+[tool.pyright]
+pythonVersion = "3.12"
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "standard"
+reportMissingImports = true
+reportUnusedImport = true
+reportUnusedVariable = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
 addopts = "-q"
-
-[tool.ruff]
-line-length = 100
-target-version = "py310"
-
-[tool.ruff.lint]
-select = ["E", "F", "I", "B", "UP"]
