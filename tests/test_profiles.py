@@ -16,9 +16,12 @@ from transcribe import (
 def test_clean_profile_defaults():
     cfg = resolve_config("clean", ConfigOverrides())
     assert cfg.denoise_enabled is False
-    assert cfg.temperature == (0.0,)
+    # Anti-hallucination guards: temperature ladder + condition OFF + logprob gate.
+    # (condition=True caused a repetition cascade on sparse/quiet openings.)
+    assert cfg.temperature == (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
     assert cfg.no_speech_threshold == 0.6
-    assert cfg.condition_on_previous_text is True
+    assert cfg.condition_on_previous_text is False
+    assert cfg.logprob_threshold == -1.0
     # Greedy decoding: beam search caused a hallucination cascade on clean audio.
     assert cfg.beam_size is None
     assert cfg.best_of is None

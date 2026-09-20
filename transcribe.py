@@ -12,11 +12,12 @@ Pipeline:
 Profiles bundle the audio + Whisper knobs that differ between clean recordings
 (e.g. phone calls) and noisy recordings (faint / far-field voices):
 
-  clean  - no denoise, greedy decoding, standard no-speech threshold,
-           condition-on-previous ON. Best for close-mic / phone audio.
-  noisy  - loudnorm denoise, temperature fallback ladder, aggressive
-           no-speech threshold, condition-on-previous OFF. Best for faint
-           voices buried in background noise.
+  clean  - no denoise, greedy decoding, standard no-speech threshold, with
+           Whisper's anti-hallucination guards on (temperature ladder,
+           condition-on-previous OFF, log-prob gate). Best for close-mic /
+           phone audio.
+  noisy  - loudnorm denoise, aggressive no-speech threshold, beam search, same
+           anti-hallucination guards. Best for faint voices in background noise.
 
 Individual flags (--denoise, --no-denoise, --condition-on-previous / --no-...)
 override the profile defaults.
@@ -59,16 +60,24 @@ class TranscribeConfig:
     beam_size: int | None = None
     best_of: int | None = None
     compression_ratio_threshold: float = 2.4
+    # Whisper's average-log-probability gate. Segments below this are retried at
+    # a higher temperature. Wiring it in (with the temperature ladder) is part
+    # of the anti-hallucination guard.
+    logprob_threshold: float = -1.0
 
 
-# The two profiles differ in exactly six knobs (see module docstring).
+# The two profiles differ in the audio + Whisper decoding knobs below.
 PROFILES: dict[str, TranscribeConfig] = {
     "clean": TranscribeConfig(
         denoise_enabled=False,
         denoise_method="loudnorm",
-        temperature=(0.0,),
+        # condition_on_previous_text=False breaks the repetition feedback loop
+        # that Whisper falls into on sparse/quiet openings (verified on a real
+        # 56-min recording). The temperature ladder + logprob/compression gates
+        # let it retry poisoned segments instead of cascading.
+        temperature=_TEMP_LADDER,
         no_speech_threshold=0.6,
-        condition_on_previous_text=True,
+        condition_on_previous_text=False,
         beam_size=None,  # greedy: correct + fast for clean audio
         best_of=None,
     ),
@@ -128,6 +137,7 @@ def resolve_config(profile: str, overrides: ConfigOverrides) -> TranscribeConfig
             else overrides.condition_on_previous_text
         ),
         compression_ratio_threshold=base.compression_ratio_threshold,
+        logprob_threshold=base.logprob_threshold,
         beam_size=base.beam_size,
         best_of=base.best_of,
     )
@@ -309,6 +319,7 @@ def transcribe_audio(
         best_of=config.best_of,
         temperature=config.temperature,
         compression_ratio_threshold=config.compression_ratio_threshold,
+        logprob_threshold=config.logprob_threshold,
         no_speech_threshold=config.no_speech_threshold,
         condition_on_previous_text=config.condition_on_previous_text,
         word_timestamps=word_timestamps,

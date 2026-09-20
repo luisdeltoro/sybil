@@ -93,17 +93,22 @@ and noisy recordings. Individual flags override the bundle.
 | Knob | `clean` (default) | `noisy` |
 |------|-------------------|---------|
 | Denoising | off | `loudnorm` |
-| `temperature` | `0.0` (greedy) | fallback ladder `0.0 … 1.0` |
+| `temperature` | fallback ladder `0.0 … 1.0` | fallback ladder `0.0 … 1.0` |
 | `no_speech_threshold` | `0.6` | `0.4` |
-| `condition_on_previous_text` | on | off |
+| `condition_on_previous_text` | off | off |
+| `logprob_threshold` | `-1.0` | `-1.0` |
 | `beam_size` / `best_of` | greedy (none) | `5` / `5` |
 
-- **`clean`** — close-mic / phone audio. Greedy decoding is used because beam
-  search was observed to trigger a word-repetition hallucination cascade with
-  word-level timestamps on clean audio.
-- **`noisy`** — faint / far-field voices in background noise. Uses loudness
-  normalization, a temperature fallback ladder, an aggressive no-speech
-  threshold, and beam search to recover hard-to-hear speech.
+- **`clean`** (default) — close-mic / phone audio. No denoising and greedy
+  decoding. It keeps Whisper's anti-hallucination guards on (temperature
+  fallback ladder, `condition_on_previous_text=False`, log-prob and compression
+  gates): on real recordings, a sparse/quiet opening (people connecting on a
+  call) otherwise sends greedy decoding into a word-repetition loop that
+  cascades and truncates the transcript. Beam search is *not* used here because
+  it triggered a separate repetition cascade with word-level timestamps.
+- **`noisy`** — faint / far-field voices in background noise. Same guards plus
+  loudness normalization, an aggressive no-speech threshold, and beam search to
+  recover hard-to-hear speech.
 
 ## How it works
 
