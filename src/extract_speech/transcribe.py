@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -942,6 +943,302 @@ def format_batch_summary(succeeded: int, skipped: int, failed: list[tuple[str, s
 
 
 # ---------------------------------------------------------------------------
+# Remote execution
+# ---------------------------------------------------------------------------
+
+DEFAULT_REMOTE_DIR = "~/.sybil"
+
+# Everything the remote needs in order to run "uv sync" and the CLI. An
+# allowlist rather than rsync --exclude, because excludes fail open: forgetting
+# one silently ships it. .env must never reach the remote -- the HuggingFace
+# token is forwarded per session over stdin instead.
+PROVISION_ALLOWLIST: tuple[str, ...] = ("pyproject.toml", "uv.lock", ".python-version", "src", "tests")
+
+
+@dataclass(frozen=True)
+class RemoteConfig:
+    """Where work happens on the remote host.
+
+    ``root`` is a remote path and may be ``~``-relative; it is never resolved
+    locally. Paths below it are built with POSIX separators because the remote
+    is a POSIX host regardless of what this client runs on.
+    """
+
+    host: str
+    root: str
+
+    def _under(self, name: str) -> str:
+        return f"{self.root.rstrip('/')}/{name}"
+
+    @property
+    def project(self) -> str:
+        """Where the checkout and its virtualenv live."""
+        return self._under("project")
+
+    @property
+    def inputs(self) -> str:
+        """Where source media is uploaded."""
+        return self._under("inputs")
+
+    @property
+    def outputs(self) -> str:
+        """Where transcripts are written, and kept between runs so an
+        interrupted batch can resume."""
+        return self._under("outputs")
+
+
+def parse_remote_config(host: str, root: str) -> RemoteConfig:
+    """Validate the remote destination.
+
+    Raises:
+        TranscriptionError: If either value is blank.
+    """
+    if not host.strip():
+        raise TranscriptionError("--run-in-remote needs a host (an ssh alias or user@host).")
+    if not root.strip():
+        raise TranscriptionError("--remote-dir needs a directory.")
+    return RemoteConfig(host=host.strip(), root=root.strip())
+
+
+def expand_remote_root(root: str, home: str) -> str:
+    """Resolve a leading ``~`` against the remote home directory.
+
+    Quoting is mandatory when sending a command through ssh, but a quoted ``~``
+    is a literal directory name to the remote shell -- it creates a folder
+    called ``~`` in the login directory instead of using ``$HOME``. Resolving it
+    up front keeps every later path absolute and safely quotable.
+
+    ``~user`` forms are left untouched: they refer to a different user's home,
+    and rewriting them against ours would silently point elsewhere.
+    """
+    if root == "~":
+        return home
+    if root.startswith("~/"):
+        return f"{home.rstrip('/')}/{root[2:]}"
+    return root
+
+
+def join_remote_command(argv: list[str]) -> str:
+    """Join an argv into a string safe for the remote shell.
+
+    ``ssh`` always hands a *string* to the remote shell, so this is the one
+    place shell quoting is unavoidable. Paths such as ``Living Room`` and any
+    metacharacters must survive intact.
+    """
+    return shlex.join(argv)
+
+
+def build_remote_argv(args: argparse.Namespace, cfg: RemoteConfig) -> list[str]:
+    """Translate the local invocation into the argv the remote should run.
+
+    The remote runs the identical CLI on the identical input, so its behaviour
+    matches a local run. Local paths are rewritten to their remote equivalents,
+    and the remote-execution flags are dropped so the remote does not try to
+    delegate onwards.
+
+    The HuggingFace token is deliberately excluded: it is passed through the
+    process environment via stdin, never on a command line where the remote's
+    ``ps`` would expose it.
+    """
+    argv: list[str] = ["extract-speech"]
+
+    if args.source is not None:
+        argv += ["--source", cfg.inputs, "--target", cfg.outputs]
+        if args.overwrite:
+            argv.append("--overwrite")
+    else:
+        # A single file is staged under inputs/ keeping its original name.
+        argv.append(f"{cfg.inputs}/{args.input.name}")
+        argv += ["--output", f"{cfg.outputs}/{args.input.stem}{TRANSCRIPT_SUFFIX}"]
+
+    argv += ["--profile", args.profile, "--whisper-model", args.whisper_model, "--language", args.language]
+
+    if args.diarize:
+        if args.speakers is not None:
+            argv += ["--speakers", str(args.speakers)]
+    else:
+        argv.append("--no-diarize")
+
+    if args.no_denoise:
+        argv.append("--no-denoise")
+    elif args.denoise is not None:
+        argv += ["--denoise", args.denoise]
+
+    if args.condition_on_previous is True:
+        argv.append("--condition-on-previous")
+    elif args.condition_on_previous is False:
+        argv.append("--no-condition-on-previous")
+
+    argv += ["--demucs-model", args.demucs_model]
+    return argv
+
+
+def _run_local(cmd: list[str], step: str, stdin_text: str | None = None) -> None:
+    """Run a local helper process (ssh/rsync), streaming its output.
+
+    A list argv means no local shell, so paths with spaces need no escaping
+    here. Remote quoting is handled by :func:`join_remote_command`.
+
+    Raises:
+        TranscriptionError: If the command is missing or exits non-zero.
+    """
+    try:
+        result = subprocess.run(cmd, input=stdin_text, text=True, check=False)
+    except FileNotFoundError as exc:
+        raise TranscriptionError(f"{step} failed: {cmd[0]} is not installed.") from exc
+    if result.returncode != 0:
+        raise TranscriptionError(f"{step} failed (exit {result.returncode}).")
+
+
+def _ssh(cfg: RemoteConfig, command: str, stdin_text: str | None = None) -> None:
+    """Run a shell command on the remote host."""
+    _run_local(["ssh", cfg.host, command], f"Remote command on {cfg.host}", stdin_text)
+
+
+def _capture_remote(cfg: RemoteConfig, command: str, step: str) -> str:
+    """Run a remote command and return its stdout, stripped."""
+    try:
+        result = subprocess.run(["ssh", cfg.host, command], capture_output=True, text=True, check=False)
+    except FileNotFoundError as exc:
+        raise TranscriptionError(f"{step} failed: ssh is not installed.") from exc
+    if result.returncode != 0:
+        raise TranscriptionError(f"{step} failed: {result.stderr.strip() or f'exit {result.returncode}'}")
+    return result.stdout.strip()
+
+
+def remote_preflight(cfg: RemoteConfig) -> RemoteConfig:
+    """Check the remote can do the work, before uploading anything.
+
+    Returns:
+        The config with its root resolved to an absolute remote path.
+
+    Raises:
+        TranscriptionError: If the host is unreachable or a tool is missing.
+    """
+    print(f"Checking {cfg.host}...")
+    home = _capture_remote(cfg, 'printf %s "$HOME"', f"Connecting to {cfg.host}")
+    if not home:
+        raise TranscriptionError(f"Could not determine the home directory on {cfg.host}.")
+    _ssh(cfg, "command -v uv >/dev/null || { echo 'uv is not installed on the remote' >&2; exit 1; }")
+    _ssh(cfg, "command -v ffmpeg >/dev/null || { echo 'ffmpeg is not installed on the remote' >&2; exit 1; }")
+    print(f"  uv and ffmpeg present; home is {home}.")
+    return RemoteConfig(host=cfg.host, root=expand_remote_root(cfg.root, home))
+
+
+def remote_provision(cfg: RemoteConfig, project_root: Path) -> None:
+    """Copy the project to the remote and install its dependencies."""
+    print(f"Provisioning {cfg.host}:{cfg.project}...")
+    _ssh(cfg, join_remote_command(["mkdir", "-p", cfg.project, cfg.inputs, cfg.outputs]))
+
+    present = [name for name in PROVISION_ALLOWLIST if (project_root / name).exists()]
+    _run_local(
+        ["rsync", "-az", "--delete", *[str(project_root / name) for name in present], f"{cfg.host}:{cfg.project}/"],
+        "Uploading project",
+    )
+    _ssh(cfg, join_remote_command(["sh", "-lc", f"cd {shlex.quote(cfg.project)} && uv sync --all-groups"]))
+    print("  Dependencies installed.")
+
+
+def build_upload_args(cfg: RemoteConfig, local: Path, is_directory: bool) -> list[str]:
+    """Build the rsync argv that stages sources on the remote.
+
+    A directory upload uses ``--delete`` so the remote staging area mirrors the
+    local source: otherwise a file deleted locally lingers remotely and is
+    rediscovered on every later run, producing phantom work (and phantom
+    failures, if it was the broken file you just removed).
+
+    A single-file upload does not delete, since it is adding one file to a
+    staging area that may hold inputs for a batch being resumed.
+
+    ``-L`` resolves symlinks and sends the file they point at. Without it the
+    link itself is copied, and a media library built from symlinks (as the
+    Conversaciones archive is) arrives on the remote as dangling pointers to
+    local paths -- the upload reports success and the run then fails with
+    "File not found".
+    """
+    source = f"{local}/" if is_directory else str(local)
+    args = ["rsync", "-az", "-L", "--partial"]
+    if is_directory:
+        args.append("--delete")
+    return [*args, source, f"{cfg.host}:{cfg.inputs}/"]
+
+
+def build_download_args(cfg: RemoteConfig, target: Path) -> list[str]:
+    """Build the rsync argv that retrieves transcripts.
+
+    Never uses ``--delete``: that would destroy transcripts, defeating the
+    guarantee that whatever finished is retrieved.
+    """
+    return ["rsync", "-az", "--partial", f"{cfg.host}:{cfg.outputs}/", f"{target}/"]
+
+
+def remote_upload_inputs(cfg: RemoteConfig, args: argparse.Namespace) -> None:
+    """Upload the sources. Originals are sent, so the remote runs exactly as local would."""
+    is_directory = args.source is not None
+    local = args.source if is_directory else args.input
+    print(f"Uploading {local} -> {cfg.host}:{cfg.inputs}...")
+    _run_local(build_upload_args(cfg, local, is_directory), "Uploading sources")
+
+
+def remote_download_outputs(cfg: RemoteConfig, args: argparse.Namespace) -> None:
+    """Retrieve whatever transcripts exist, including after a partial run."""
+    if args.source is not None:
+        args.target.mkdir(parents=True, exist_ok=True)
+        print(f"Downloading transcripts -> {args.target}...")
+        _run_local(build_download_args(cfg, args.target), "Downloading")
+    else:
+        destination = args.output or Path(f"{args.input.stem}{TRANSCRIPT_SUFFIX}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        remote_file = f"{cfg.outputs}/{args.input.stem}{TRANSCRIPT_SUFFIX}"
+        print(f"Downloading transcript -> {destination}...")
+        _run_local(["rsync", "-az", f"{cfg.host}:{remote_file}", str(destination)], "Downloading")
+
+
+def run_remote(args: argparse.Namespace, hf_token: str, project_root: Path) -> int:
+    """Orchestrate a remote run and return a process exit code.
+
+    Transcripts are downloaded even when the remote run fails, so an
+    interrupted batch keeps the files it completed. Because the remote's output
+    directory persists and batch mode skips existing transcripts, repeating the
+    command resumes where it stopped.
+    """
+    cfg = parse_remote_config(args.run_in_remote, args.remote_dir)
+
+    cfg = remote_preflight(cfg)
+    remote_provision(cfg, project_root)
+    remote_upload_inputs(cfg, args)
+
+    # The token is piped over the encrypted channel and exported inside the
+    # remote shell, so it never lands on the remote disk or in a command line.
+    command = join_remote_command(["uv", "run", *build_remote_argv(args, cfg)])
+    wrapper = (
+        f"cd {shlex.quote(cfg.project)} && "
+        + ("IFS= read -r HF_TOKEN && export HF_TOKEN && " if hf_token else "")
+        + command
+    )
+
+    print(f"\nRunning on {cfg.host}:\n  {command}\n")
+    failure: TranscriptionError | None = None
+    try:
+        _ssh(cfg, f"sh -lc {shlex.quote(wrapper)}", stdin_text=f"{hf_token}\n" if hf_token else None)
+    except TranscriptionError as exc:
+        failure = exc
+        print(f"Remote run failed: {exc}", file=sys.stderr)
+        print("Retrieving any transcripts it completed...", file=sys.stderr)
+
+    remote_download_outputs(cfg, args)
+
+    if failure is not None:
+        print(
+            f"\nRe-run the same command to resume: finished transcripts are kept on {cfg.host} and will be skipped.",
+            file=sys.stderr,
+        )
+        return 1
+    print("Done.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1002,6 +1299,27 @@ https://hf.co/pyannote/speaker-diarization-community-1
         "--overwrite",
         action="store_true",
         help="Re-transcribe files whose transcript already exists (default: skip them)",
+    )
+
+    # Remote execution
+    parser.add_argument(
+        "--run-in-remote",
+        metavar="HOST",
+        default=None,
+        help=(
+            "Run the transcription on HOST over SSH (an ssh alias or user@host). "
+            "Sources are uploaded, the same CLI runs there, and transcripts are "
+            "downloaded back. Works for a single file or with --source/--target"
+        ),
+    )
+    parser.add_argument(
+        "--remote-dir",
+        default=DEFAULT_REMOTE_DIR,
+        help=(
+            f"Working directory on the remote host (default: {DEFAULT_REMOTE_DIR}). "
+            "Kept between runs so re-provisioning is fast and an interrupted "
+            "batch can resume"
+        ),
     )
 
     parser.add_argument(
@@ -1314,11 +1632,20 @@ def main() -> None:
         print("Error: --speakers must be >= 1", file=sys.stderr)
         sys.exit(1)
 
+    # Resolve the token early so we fail fast before heavy work. Remote runs
+    # need it too, to forward to the host.
+    hf_token = resolve_hf_token(args.hf_token) if args.diarize else ""
+
+    if args.run_in_remote:
+        # ffmpeg and the models are the remote's concern, not this machine's.
+        try:
+            sys.exit(run_remote(args, hf_token, Path(__file__).resolve().parents[2]))
+        except TranscriptionError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+
     check_ffmpeg()
     config = resolve_config(args.profile, overrides_from_args(args))
-
-    # Resolve the token early so we fail fast before heavy work.
-    hf_token = resolve_hf_token(args.hf_token) if args.diarize else ""
 
     try:
         sys.exit(_run_batch(args, config, hf_token) if batch else _run_single(args, config, hf_token))

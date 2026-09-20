@@ -35,6 +35,7 @@ All commands run from the repo root.
 | Everything | `make all` |
 | Run the tool | `uv run extract-speech <file> [options]` |
 | Batch a folder | `uv run extract-speech --source DIR --target DIR` |
+| Run on another host | `uv run extract-speech ... --run-in-remote HOST` |
 
 Never invoke `pytest`, `ruff` or `pyright` directly — go through `make` (or
 `uv run`) so the correct environment is used.
@@ -79,6 +80,26 @@ When adding a feature, put the decidable logic in a pure function and test that
 directly, rather than reaching for mocks of the ML stack.
 
 ---
+
+## Remote execution
+
+Orchestration is Python calling `ssh`/`rsync` via `subprocess` with list argv —
+there are no shell scripts. Three rules, each of which cost a debugging cycle:
+
+- **Resolve `~` before quoting.** `ssh` needs a command *string*, so paths get
+  `shlex.quote`d — and a quoted `~` is a literal directory name, which creates a
+  folder called `~` in the login directory. `remote_preflight` reads `$HOME` and
+  `expand_remote_root` rewrites the root to an absolute path first.
+- **Upload with `rsync -L`.** Without it, symlinked sources arrive as dangling
+  links to local paths; the upload reports success and the run then fails with
+  "File not found".
+- **`--delete` on input uploads, never on output downloads.** Inputs must mirror
+  local or stale files are rediscovered forever; deleting outputs would destroy
+  the transcripts a resumed run depends on.
+
+Provisioning uses an **allowlist** (`PROVISION_ALLOWLIST`), not rsync excludes:
+excludes fail open, and `.env` must never reach the remote. The HF token is
+piped over stdin into the process environment instead.
 
 ## Known gotchas (learned the hard way — do not regress these)
 

@@ -83,6 +83,38 @@ flattening would silently overwrite one transcript with another.
   every failure and the exit code is non-zero if there was any.
 - Non-media files are ignored.
 
+### Remote execution
+
+Offload the work to a machine you have SSH access to — useful when a large model
+or a long recording is too much for this laptop:
+
+```bash
+uv run extract-speech --source ~/Downloads/Tapo --target ~/transcripts \
+  --run-in-remote my-box --whisper-model large
+```
+
+Works for a single file too. The remote runs **the same CLI on the same original
+files**, so its output matches a local run; nothing is converted beforehand.
+
+Phases: preflight (`uv` and `ffmpeg` present) → provision (`rsync` the project,
+`uv sync`) → upload sources → run remotely → download transcripts.
+
+- `--remote-dir` (default `~/.sybil`) is kept between runs, so re-provisioning
+  takes seconds and a batch can resume.
+- **Interrupted runs keep their work.** Transcripts are downloaded even when the
+  remote run fails; re-running the same command resumes, because the remote
+  target persists and finished files are skipped.
+- Only `pyproject.toml`, `uv.lock`, `.python-version`, `src/` and `tests/` are
+  uploaded — an allowlist, so `.env` can never be shipped by accident.
+- The HuggingFace token is piped over the SSH channel into the remote process
+  environment. It is never written to the remote disk, nor placed on a command
+  line where the remote's `ps` would show it.
+- Symlinked sources are followed (`rsync -L`), so a library of symlinks
+  transfers the real files rather than dangling pointers.
+
+Requirements on the remote: `uv`, `ffmpeg`, and SSH access. Python is supplied by
+`uv` per `.python-version`, so the remote's own Python does not matter.
+
 ### Single file
 
 ```bash
@@ -108,6 +140,8 @@ uv run extract-speech talk.mp4 --no-diarize --whisper-model large --language en
 | `--source` | — | Directory to transcribe recursively; requires `--target` |
 | `--target` | — | Output directory for batch mode; mirrors the `--source` tree |
 | `--overwrite` | off | Re-transcribe files that already have a transcript |
+| `--run-in-remote` | — | SSH host to run the transcription on |
+| `--remote-dir` | `~/.sybil` | Working directory on the remote host |
 | `--profile` | `clean` | Knob bundle: `clean` or `noisy` (see below) |
 | `--whisper-model` (alias `--model`) | `medium` | `tiny`, `base`, `small`, `medium`, `large` |
 | `--language` | `es` | Language code (`es`, `en`, `fr`, `de`, …) |
