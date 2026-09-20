@@ -86,7 +86,8 @@ uv run extract-speech talk.mp4 --no-diarize --whisper-model large --language en
 | `--speakers` | auto | Force an exact number of speakers |
 | `--hf-token` | env `HF_TOKEN` | HuggingFace token for diarization |
 | `--output` / `-o` | stdout | Save transcript to a file |
-| `--denoise` | (profile) | Override denoise method: `loudnorm`, `spectral`, `ffmpeg` |
+| `--denoise` | (profile) | Override denoise method: `loudnorm`, `spectral`, `ffmpeg`, `demucs` |
+| `--demucs-model` | `htdemucs` | Demucs model for `--denoise demucs` |
 | `--no-denoise` | (profile) | Override: skip denoising entirely |
 | `--condition-on-previous` / `--no-condition-on-previous` | (profile) | Override Whisper's condition-on-previous-text |
 
@@ -97,7 +98,7 @@ and noisy recordings. Individual flags override the bundle.
 
 | Knob | `clean` (default) | `noisy` |
 |------|-------------------|---------|
-| Denoising | off | `loudnorm` |
+| Denoising | off | **`demucs`** (vocal isolation) |
 | `temperature` | fallback ladder `0.0 … 1.0` | fallback ladder `0.0 … 1.0` |
 | `no_speech_threshold` | `0.6` | `0.4` |
 | `condition_on_previous_text` | off | off |
@@ -112,8 +113,20 @@ and noisy recordings. Individual flags override the bundle.
   cascades and truncates the transcript. Beam search is *not* used here because
   it triggered a separate repetition cascade with word-level timestamps.
 - **`noisy`** — faint / far-field voices in background noise. Same guards plus
-  loudness normalization, an aggressive no-speech threshold, and beam search to
-  recover hard-to-hear speech.
+  **Demucs vocal isolation**, an aggressive no-speech threshold, and beam search
+  to recover hard-to-hear speech.
+
+  Measured on real far-field recordings, Demucs removed 34–43% of non-vocal
+  energy and largely eliminated Whisper's hallucinations. On one security-camera
+  clip the transcript went from **14 segments to 1**: `loudnorm` produced six
+  `...` segments, a repeated "Y escapillada" loop, and one line duplicated
+  verbatim, while Demucs left only the single real utterance.
+
+  It is not free: **~0.15× realtime and ~1.4 GB RAM** (about +8½ minutes on a
+  56-minute recording). Use `--denoise loudnorm` for the old cheap behaviour, and
+  note it is pointless on clean audio — on a clean phone call it removed 0.1% of
+  energy. Pick the model with `--demucs-model` (default `htdemucs`; `htdemucs_ft`
+  is a bag of four networks, better but ~4× slower).
 
 ## How it works
 
@@ -124,7 +137,9 @@ and noisy recordings. Individual flags override the bundle.
    a long transcription has already run.
 3. **Denoising** — profile-dependent; applied only to the Whisper input.
    Diarization always uses the **raw** audio, since denoising can distort
-   speaker voiceprints.
+   speaker voiceprints. `loudnorm`, `spectral` and `ffmpeg` filter the extracted
+   16 kHz mono WAV; `demucs` instead re-extracts 44.1 kHz stereo from the
+   original source (see below).
 4. **Transcription** — Whisper produces word-level timestamps (when diarizing).
 5. **Diarization + alignment** — the raw audio is read into memory and passed to
    pyannote as a waveform, not as a file path (see below). pyannote produces
@@ -132,6 +147,20 @@ and noisy recordings. Individual flags override the bundle.
    same-speaker words are merged into utterances. This splits speaker changes
    that occur *inside* a Whisper segment. Speakers are numbered by first
    appearance.
+
+### Why Demucs re-extracts from the source
+
+Demucs requires **44,100 Hz stereo** (`model.samplerate` / `model.audio_channels`),
+but step 1 produces 16 kHz mono for Whisper. Reusing that file would hand Demucs
+audio already stripped of everything above 8 kHz *and* of the inter-channel
+differences separation models depend on. So `denoise_demucs` runs its own
+extraction from `AudioInputs.source`.
+
+A single ffmpeg invocation covers both cases: it upsamples and duplicates a
+16 kHz mono source (no loss — there was nothing above 8 kHz to keep), and
+properly downsamples a 48 kHz stereo one while keeping the channels distinct.
+The extra decode costs ~3 s even on a 6 GB, 56-minute video, since `-vn` skips
+the video stream entirely.
 
 ### Why audio is passed to pyannote in memory
 

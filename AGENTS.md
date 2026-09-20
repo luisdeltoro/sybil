@@ -96,10 +96,20 @@ directly, rather than reaching for mocks of the ML stack.
 5. **Load the diarization pipeline before transcribing.** Loading validates the
    token and model licence in seconds; transcription takes tens of minutes.
    `main()` deliberately calls `load_diarization_pipeline` up front.
-6. **Whisper segment boundaries do not align with speaker changes.** Speaker
+6. **Never feed Demucs the extracted 16 kHz mono WAV.** It needs 44.1 kHz
+   stereo, so `denoise_demucs` re-extracts from `AudioInputs.source`. Passing it
+   `AudioInputs.extracted` would discard everything above 8 kHz *and* the
+   inter-channel differences separation depends on — and it would fail silently,
+   producing worse separation rather than an error. This is what `AudioInputs`
+   exists to make explicit.
+7. **Demucs normalisation statistics come from the channel average**
+   (`ref = wav.mean(0)`), not per channel — so two independent channels of scale
+   `s` yield `s/√2`. Mirror demucs' own `separate.py` exactly; getting it wrong
+   silently changes the model's input scale instead of raising.
+8. **Whisper segment boundaries do not align with speaker changes.** Speaker
    attribution is done per *word*, then merged — see `group_words_by_speaker`.
    Attributing whole segments produces visibly wrong transcripts.
-7. **Auto speaker detection over-splits.** Short backchannels ("sí", "vale") get
+9. **Auto speaker detection over-splits.** Short backchannels ("sí", "vale") get
    assigned their own speaker. Pass `--speakers N` when the count is known.
 
 ---

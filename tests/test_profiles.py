@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from extract_speech.transcribe import (
+    DENOISE_METHODS,
     PROFILES,
     ConfigOverrides,
     build_parser,
@@ -30,12 +31,25 @@ def test_clean_profile_defaults():
 def test_noisy_profile_defaults():
     cfg = resolve_config("noisy", ConfigOverrides())
     assert cfg.denoise_enabled is True
-    assert cfg.denoise_method == "loudnorm"
+    # Demucs vocal isolation, not loudnorm: on noisy recordings it removed
+    # 34-43% of non-vocal energy and collapsed hallucinated segment runs
+    # (17 -> 1 on a Tapo clip). It costs ~0.15x realtime, so `--denoise
+    # loudnorm` remains available when that trade is not wanted.
+    assert cfg.denoise_method == "demucs"
     assert cfg.temperature == (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
     assert cfg.no_speech_threshold == 0.4
     assert cfg.condition_on_previous_text is False
     assert cfg.beam_size == 5
     assert cfg.best_of == 5
+
+
+def test_all_denoise_methods_are_registered():
+    assert set(DENOISE_METHODS) == {"loudnorm", "spectral", "ffmpeg", "demucs"}
+
+
+def test_every_profile_names_a_real_denoise_method():
+    for name, cfg in PROFILES.items():
+        assert cfg.denoise_method in DENOISE_METHODS, name
 
 
 def test_unknown_profile_raises():
@@ -97,6 +111,24 @@ def test_cli_whisper_model_flag():
 def test_cli_speakers_forced():
     args = build_parser().parse_args(["video.mp4", "--speakers", "3"])
     assert args.speakers == 3
+
+
+def test_cli_demucs_model_defaults_to_htdemucs():
+    # htdemucs is a single network; htdemucs_ft is a bag of four and ~4x slower.
+    args = build_parser().parse_args(["video.mp4"])
+    assert args.demucs_model == "htdemucs"
+
+
+def test_cli_demucs_model_can_be_overridden():
+    args = build_parser().parse_args(["video.mp4", "--demucs-model", "htdemucs_ft"])
+    assert args.demucs_model == "htdemucs_ft"
+
+
+def test_cli_denoise_accepts_demucs():
+    args = build_parser().parse_args(["video.mp4", "--denoise", "demucs"])
+    ov = overrides_from_args(args)
+    assert ov.denoise_enabled is True
+    assert ov.denoise_method == "demucs"
 
 
 def test_overrides_no_denoise_wins():

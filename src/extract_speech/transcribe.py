@@ -16,8 +16,10 @@ Profiles bundle the audio + Whisper knobs that differ between clean recordings
            Whisper's anti-hallucination guards on (temperature ladder,
            condition-on-previous OFF, log-prob gate). Best for close-mic /
            phone audio.
-  noisy  - loudnorm denoise, aggressive no-speech threshold, beam search, same
-           anti-hallucination guards. Best for faint voices in background noise.
+  noisy  - Demucs vocal isolation, aggressive no-speech threshold, beam search,
+           same anti-hallucination guards. Best for faint voices in background
+           noise. Demucs costs ~0.15x realtime and ~1.4 GB RAM; use
+           "--denoise loudnorm" for the cheap variant.
 
 Individual flags (--denoise, --no-denoise, --condition-on-previous / --no-...)
 override the profile defaults.
@@ -89,7 +91,13 @@ PROFILES: dict[str, TranscribeConfig] = {
     ),
     "noisy": TranscribeConfig(
         denoise_enabled=True,
-        denoise_method="loudnorm",
+        # Demucs vocal isolation rather than loudnorm. Measured on real
+        # far-field recordings: 34-43% of non-vocal energy removed, and
+        # Whisper's repetition hallucinations largely eliminated (one clip went
+        # from 17 segments, including a "si si si si..." loop, to 1). It costs
+        # ~0.15x realtime and ~1.4 GB of RAM, so `--denoise loudnorm` is still
+        # there when that trade is not wanted.
+        denoise_method="demucs",
         temperature=_TEMP_LADDER,
         no_speech_threshold=0.4,
         condition_on_previous_text=False,
@@ -167,6 +175,22 @@ class SpeakerTurn:
     start: float
     end: float
     speaker: str  # raw pyannote label, e.g. "SPEAKER_00"
+
+
+@dataclass(frozen=True)
+class AudioInputs:
+    """The audio a denoise step may draw on.
+
+    Filter-based methods read ``extracted``, the 16 kHz mono WAV that Whisper
+    and pyannote also consume. Source separation reads ``source`` instead: it
+    requires 44.1 kHz stereo, and feeding it ``extracted`` would hand it audio
+    that had already been downsampled to 16 kHz and downmixed to mono, throwing
+    away both the >8 kHz band and the inter-channel differences that separation
+    models rely on.
+    """
+
+    source: Path
+    extracted: Path
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +276,7 @@ def read_waveform(wav_path: Path) -> tuple[np.ndarray, int]:
     return data.T, int(rate)
 
 
-def denoise_loudnorm(input_wav: Path, output_wav: Path) -> None:
+def denoise_loudnorm(inputs: AudioInputs, output_wav: Path) -> None:
     """Apply EBU R128 loudness normalization via ffmpeg.
 
     Boosts quiet speech to a standard broadcast level without aggressive
@@ -263,7 +287,7 @@ def denoise_loudnorm(input_wav: Path, output_wav: Path) -> None:
         [
             "ffmpeg",
             "-i",
-            str(input_wav),
+            str(inputs.extracted),
             "-af",
             "loudnorm=I=-16:TP=-1.5:LRA=11",
             "-ar",
@@ -278,19 +302,19 @@ def denoise_loudnorm(input_wav: Path, output_wav: Path) -> None:
     print("  Loudness normalization complete.")
 
 
-def denoise_spectral(input_wav: Path, output_wav: Path) -> None:
+def denoise_spectral(inputs: AudioInputs, output_wav: Path) -> None:
     """Apply spectral noise reduction using ``noisereduce`` (spectral gating)."""
     import noisereduce as nr
     import soundfile as sf
 
     print("Applying spectral noise reduction...")
-    data, rate = sf.read(str(input_wav))
+    data, rate = sf.read(str(inputs.extracted))
     reduced = nr.reduce_noise(y=data, sr=rate, stationary=True, prop_decrease=0.75)
     sf.write(str(output_wav), reduced, rate)
     print("  Spectral noise reduction complete.")
 
 
-def denoise_ffmpeg_filters(input_wav: Path, output_wav: Path) -> None:
+def denoise_ffmpeg_filters(inputs: AudioInputs, output_wav: Path) -> None:
     """Bandpass (300-3500 Hz) + FFT denoise + dynamic normalization via ffmpeg."""
     print("Applying ffmpeg filters (bandpass + afftdn + dynaudnorm)...")
     filters = ",".join(
@@ -305,7 +329,7 @@ def denoise_ffmpeg_filters(input_wav: Path, output_wav: Path) -> None:
         [
             "ffmpeg",
             "-i",
-            str(input_wav),
+            str(inputs.extracted),
             "-af",
             filters,
             "-ar",
@@ -320,10 +344,167 @@ def denoise_ffmpeg_filters(input_wav: Path, output_wav: Path) -> None:
     print("  FFmpeg filter processing complete.")
 
 
+# ---------------------------------------------------------------------------
+# Demucs source separation (vocal isolation)
+# ---------------------------------------------------------------------------
+
+# What the htdemucs family is trained on; apply_model does not resample.
+DEMUCS_SAMPLE_RATE = 44100
+DEMUCS_CHANNELS = 2
+DEFAULT_DEMUCS_MODEL = "htdemucs"
+
+
+def available_demucs_models() -> list[str]:
+    """List the bag names demucs ships, without loading any weights."""
+    import demucs
+
+    remote = Path(demucs.__file__).parent / "remote"
+    return sorted(p.stem for p in remote.glob("*.yaml"))
+
+
+def validate_demucs_model(name: str, available: list[str]) -> str:
+    """Check a Demucs model name against the installed bags.
+
+    Raises:
+        TranscriptionError: If ``name`` is not one of ``available``.
+    """
+    if name not in available:
+        raise TranscriptionError(f"Unknown Demucs model {name!r}. Available: {', '.join(available)}")
+    return name
+
+
+def normalise_for_demucs(waveform: np.ndarray) -> tuple[np.ndarray, float, float]:
+    """Centre and scale a waveform the way demucs' own reference code does.
+
+    demucs derives the statistics from the *channel average* rather than per
+    channel (``ref = wav.mean(0)``), so the two channels stay on a common scale.
+
+    Args:
+        waveform: A ``(channel, time)`` array.
+
+    Returns:
+        The normalised waveform, plus the mean and standard deviation needed to
+        undo it. A zero standard deviation (silent or constant audio) is
+        reported as ``1.0`` so the scaling stays a no-op instead of producing
+        NaNs that would silently poison the separation.
+    """
+    ref = waveform.mean(axis=0)
+    mean = float(ref.mean())
+    std = float(ref.std())
+    if std == 0.0:
+        std = 1.0
+    return (waveform - mean) / std, mean, std
+
+
+def denormalise_stems(stems: Any, mean: float, std: float) -> Any:
+    """Invert :func:`normalise_for_demucs` on the separated stems."""
+    return stems * std + mean
+
+
+def stem_index(sources: list[str], stem: str) -> int:
+    """Return the position of ``stem`` in a model's source list.
+
+    Raises:
+        TranscriptionError: If the model does not produce that stem.
+    """
+    if stem not in sources:
+        raise TranscriptionError(f"Model does not produce a {stem!r} stem. It produces: {', '.join(sources)}")
+    return sources.index(stem)
+
+
+def denoise_demucs(inputs: AudioInputs, output_wav: Path, model_name: str = DEFAULT_DEMUCS_MODEL) -> None:
+    """Isolate the vocal stem with Demucs and write it as 16 kHz mono.
+
+    Unlike the filter-based methods this reads ``inputs.source`` rather than the
+    extracted 16 kHz mono WAV, because Demucs needs 44.1 kHz stereo and must not
+    be fed audio that has already been downsampled and downmixed.
+
+    On noisy recordings this removed 34-43% of non-vocal energy and sharply
+    reduced Whisper's repetition hallucinations. On clean close-mic audio it
+    removes almost nothing (~0.1%), so it is not worth its cost there.
+    """
+    import torch
+    from demucs.apply import apply_model
+    from demucs.pretrained import get_model
+
+    validate_demucs_model(model_name, available_demucs_models())
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        demucs_in = tmp / "demucs_in.wav"
+
+        # Extract straight from the source at the model's native format. One
+        # ffmpeg call covers both cases: it upsamples and duplicates a 16 kHz
+        # mono source, and properly downsamples a 48 kHz stereo one while
+        # keeping the two channels distinct.
+        print(f"Extracting {DEMUCS_SAMPLE_RATE} Hz stereo audio for Demucs...")
+        _run_ffmpeg(
+            [
+                "ffmpeg",
+                "-i",
+                str(inputs.source),
+                "-vn",
+                "-acodec",
+                "pcm_s16le",
+                "-ar",
+                str(DEMUCS_SAMPLE_RATE),
+                "-ac",
+                str(DEMUCS_CHANNELS),
+                "-y",
+                str(demucs_in),
+            ],
+            "Demucs audio extraction",
+        )
+
+        waveform, rate = read_waveform(demucs_in)
+        if waveform.shape[0] != DEMUCS_CHANNELS:
+            raise TranscriptionError(
+                f"Demucs needs {DEMUCS_CHANNELS} channels but got {waveform.shape[0]} from {demucs_in}."
+            )
+
+        print(f"Loading Demucs model: {model_name}")
+        model = get_model(model_name)
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+        model.to(device)
+        model.eval()
+
+        normalised, mean, std = normalise_for_demucs(waveform)
+
+        print(f"Separating vocals on {device} (this is the slow step)...")
+        with torch.no_grad():
+            stems = apply_model(model, torch.from_numpy(normalised)[None], device=device, progress=False)[0]
+        stems = denormalise_stems(stems, mean, std)
+
+        vocals = stems[stem_index(list(model.sources), "vocals")]
+
+        # Back to the 16 kHz mono that Whisper expects, via ffmpeg so the
+        # resampling matches the rest of the pipeline.
+        vocals_wav = tmp / "vocals.wav"
+        import soundfile as sf
+
+        sf.write(str(vocals_wav), vocals.mean(0).cpu().numpy(), rate)
+        _run_ffmpeg(
+            [
+                "ffmpeg",
+                "-i",
+                str(vocals_wav),
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                "-y",
+                str(output_wav),
+            ],
+            "Vocal stem downmix",
+        )
+        print("  Vocal isolation complete.")
+
+
 DENOISE_METHODS = {
     "loudnorm": denoise_loudnorm,
     "spectral": denoise_spectral,
     "ffmpeg": denoise_ffmpeg_filters,
+    "demucs": denoise_demucs,
 }
 
 
@@ -687,6 +868,15 @@ https://hf.co/pyannote/speaker-diarization-community-1
         help="Override denoise method (implies denoising ON)",
     )
     parser.add_argument(
+        "--demucs-model",
+        default=DEFAULT_DEMUCS_MODEL,
+        help=(
+            f"Demucs model for --denoise demucs (default: {DEFAULT_DEMUCS_MODEL}). "
+            "htdemucs is a single network; htdemucs_ft is a bag of four, "
+            "higher quality but roughly 4x slower"
+        ),
+    )
+    parser.add_argument(
         "--no-denoise",
         action="store_true",
         help="Override: skip noise reduction entirely",
@@ -798,6 +988,7 @@ def main() -> None:
 
             # Step 1: extract audio
             extract_audio(args.input, raw_wav)
+            audio_inputs = AudioInputs(source=args.input, extracted=raw_wav)
 
             # Fail fast: verify the extracted audio is readable and non-empty,
             # and load the diarization pipeline (which validates the token and
@@ -805,11 +996,16 @@ def main() -> None:
             # recording takes tens of minutes, so a problem that is knowable
             # now should not surface only after that work is thrown away.
             read_waveform(raw_wav)
+            if config.denoise_enabled and config.denoise_method == "demucs":
+                validate_demucs_model(args.demucs_model, available_demucs_models())
             pipeline = load_diarization_pipeline(hf_token) if args.diarize else None
 
             # Step 2: denoise (Whisper input only; diarization uses raw audio)
             if config.denoise_enabled:
-                DENOISE_METHODS[config.denoise_method](raw_wav, clean_wav)
+                if config.denoise_method == "demucs":
+                    denoise_demucs(audio_inputs, clean_wav, args.demucs_model)
+                else:
+                    DENOISE_METHODS[config.denoise_method](audio_inputs, clean_wav)
                 whisper_input = clean_wav
             else:
                 print("Denoising disabled (profile/override).")
