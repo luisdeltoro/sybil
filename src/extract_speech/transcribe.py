@@ -33,7 +33,12 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    # Imported for annotations only; the runtime import lives in read_waveform
+    # so that --help and the test suite stay free of heavy imports.
+    import numpy as np
 
 # ---------------------------------------------------------------------------
 # Configuration model + profiles
@@ -211,6 +216,42 @@ def extract_audio(input_path: Path, output_wav: Path) -> None:
     print(f"  Audio extracted: {output_wav.name}")
 
 
+def read_waveform(wav_path: Path) -> tuple[np.ndarray, int]:
+    """Read a WAV file into memory as a ``(channel, time)`` float32 array.
+
+    Diarization is handed this waveform instead of a file path, so pyannote
+    never invokes its own audio decoder. That decoder (torchcodec) links
+    FFmpeg's C libraries by exact version and breaks whenever FFmpeg is
+    upgraded; ffmpeg has already produced plain PCM by this point, so decoding
+    it a second time is redundant anyway.
+
+    The ``(channel, time)`` orientation and 2-D shape are required by
+    pyannote's own input validation.
+
+    Args:
+        wav_path: A WAV file, normally the output of :func:`extract_audio`.
+
+    Returns:
+        The samples as a ``(channel, time)`` float32 array, and the sample rate.
+
+    Raises:
+        TranscriptionError: If the file cannot be read, or contains no samples.
+    """
+    import soundfile as sf
+
+    try:
+        # always_2d gives (time, channel) uniformly, for mono and multichannel.
+        data, rate = sf.read(str(wav_path), dtype="float32", always_2d=True)
+    except Exception as exc:  # noqa: BLE001 - soundfile raises several types
+        raise TranscriptionError(f"Could not read audio from {wav_path}: {exc}") from exc
+
+    if data.shape[0] == 0:
+        raise TranscriptionError(f"{wav_path} contains no audio samples. The source file may have no audio stream.")
+
+    # soundfile is time-major; pyannote wants channel-major.
+    return data.T, int(rate)
+
+
 def denoise_loudnorm(input_wav: Path, output_wav: Path) -> None:
     """Apply EBU R128 loudness normalization via ffmpeg.
 
@@ -332,18 +373,26 @@ def transcribe_audio(
 # ---------------------------------------------------------------------------
 
 
-def diarize_audio(audio_path: Path, hf_token: str, num_speakers: int | None) -> list[SpeakerTurn]:
-    """Run pyannote speaker diarization and return speaker turns.
+def load_diarization_pipeline(hf_token: str) -> Any:
+    """Load the pyannote diarization pipeline and move it to the best device.
 
-    Note: diarization uses the *raw* extracted audio, never the denoised
-    version, because denoising can distort speaker voiceprints.
+    Kept separate from :func:`run_diarization` so the caller can load the
+    pipeline *before* transcription starts. Loading validates the token and the
+    model licence, and those are the failures worth surfacing in seconds rather
+    than after a long transcription has already run.
+
+    Args:
+        hf_token: A HuggingFace token with access to the pyannote models.
+
+    Returns:
+        The ready-to-use pipeline. Untyped because pyannote's own annotations
+        provide no usable information.
 
     Raises:
-        TranscriptionError: If the pipeline cannot be loaded or run.
+        TranscriptionError: If the pipeline cannot be loaded.
     """
     import torch
     from pyannote.audio import Pipeline
-    from pyannote.audio.pipelines.utils.hook import ProgressHook
 
     print("Loading pyannote diarization pipeline (community-1)...")
     try:
@@ -374,20 +423,54 @@ def diarize_audio(audio_path: Path, hf_token: str, num_speakers: int | None) -> 
         print(f"  ({device} unavailable for pyannote; falling back to cpu)")
         pipeline.to(torch.device("cpu"))
 
+    return pipeline
+
+
+def turns_from_diarization(diarization: Any) -> list[SpeakerTurn]:
+    """Convert a pyannote ``Annotation`` into :class:`SpeakerTurn` objects.
+
+    ``yield_label=True`` is required: without it ``itertracks`` yields
+    ``(segment, track_id)`` pairs and the label is lost.
+    """
+    return [
+        SpeakerTurn(start=segment.start, end=segment.end, speaker=label)
+        for segment, _, label in diarization.itertracks(yield_label=True)
+    ]
+
+
+def run_diarization(pipeline: Any, audio_path: Path, num_speakers: int | None) -> list[SpeakerTurn]:
+    """Diarize ``audio_path`` with an already-loaded pipeline.
+
+    The audio is read into memory and handed to pyannote as a waveform mapping
+    rather than as a path. pyannote accepts either (its ``AudioFile`` type is
+    ``str | Path | IOBase | Mapping``), but the path form makes it decode the
+    file with torchcodec, which links FFmpeg's C libraries by exact version and
+    fails whenever FFmpeg is upgraded. ffmpeg has already produced plain PCM at
+    this point, so the waveform form also avoids decoding the same audio twice.
+
+    Note: diarization uses the *raw* extracted audio, never the denoised
+    version, because denoising can distort speaker voiceprints.
+
+    Raises:
+        TranscriptionError: If the audio cannot be read.
+    """
+    import torch
+    from pyannote.audio.pipelines.utils.hook import ProgressHook
+
+    waveform, sample_rate = read_waveform(audio_path)
+
     print("Running diarization...")
     kwargs: dict = {}
     if num_speakers is not None:
         kwargs["num_speakers"] = num_speakers
     with ProgressHook() as hook:
-        # Pipeline.__call__ is annotated "Any | Iterator[tuple[Any, Any]]", which
-        # carries no usable information. community-1 returns a result object
-        # exposing .speaker_diarization; treat it as untyped rather than pretend.
-        output: Any = pipeline(str(audio_path), hook=hook, **kwargs)
+        output: Any = pipeline(
+            {"waveform": torch.from_numpy(waveform), "sample_rate": sample_rate},
+            hook=hook,
+            **kwargs,
+        )
 
-    return [
-        SpeakerTurn(start=segment.start, end=segment.end, speaker=label)
-        for segment, _, label in output.speaker_diarization.itertracks(yield_label=True)
-    ]
+    return turns_from_diarization(output.speaker_diarization)
 
 
 def build_speaker_map(turns: list[SpeakerTurn]) -> dict[str, int]:
@@ -716,6 +799,14 @@ def main() -> None:
             # Step 1: extract audio
             extract_audio(args.input, raw_wav)
 
+            # Fail fast: verify the extracted audio is readable and non-empty,
+            # and load the diarization pipeline (which validates the token and
+            # the model licence) *before* transcription. Transcribing a long
+            # recording takes tens of minutes, so a problem that is knowable
+            # now should not surface only after that work is thrown away.
+            read_waveform(raw_wav)
+            pipeline = load_diarization_pipeline(hf_token) if args.diarize else None
+
             # Step 2: denoise (Whisper input only; diarization uses raw audio)
             if config.denoise_enabled:
                 DENOISE_METHODS[config.denoise_method](raw_wav, clean_wav)
@@ -738,8 +829,8 @@ def main() -> None:
                 sys.exit(0)
 
             # Step 4: diarize + align (optional)
-            if args.diarize:
-                turns = diarize_audio(raw_wav, hf_token, args.speakers)
+            if pipeline is not None:
+                turns = run_diarization(pipeline, raw_wav, args.speakers)
                 if not turns:
                     print(
                         "Warning: no speakers detected; emitting plain transcript.",

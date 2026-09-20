@@ -84,11 +84,22 @@ directly, rather than reaching for mocks of the ML stack.
    (`beam_size=None`). Do not "optimise" this by turning beam search on.
 3. **Diarization must run on the raw audio, never the denoised audio.**
    Denoising distorts voiceprints and degrades speaker attribution. See
-   `main()` — `diarize_audio(raw_wav, ...)` while Whisper gets `whisper_input`.
-4. **Whisper segment boundaries do not align with speaker changes.** Speaker
+   `main()` — `run_diarization(pipeline, raw_wav, ...)` while Whisper gets
+   `whisper_input`.
+4. **Never hand pyannote a file path.** Pass a waveform mapping —
+   `{"waveform": tensor, "sample_rate": rate}` — as `run_diarization` does.
+   The path form makes pyannote decode the file with torchcodec, which links
+   FFmpeg's C libraries by exact soname and breaks on every FFmpeg major
+   upgrade (ffmpeg 9 ships `libavutil.61`; torchcodec 0.13 wants 56-60). The
+   waveform form is a documented pyannote input and also avoids decoding the
+   same audio twice.
+5. **Load the diarization pipeline before transcribing.** Loading validates the
+   token and model licence in seconds; transcription takes tens of minutes.
+   `main()` deliberately calls `load_diarization_pipeline` up front.
+6. **Whisper segment boundaries do not align with speaker changes.** Speaker
    attribution is done per *word*, then merged — see `group_words_by_speaker`.
    Attributing whole segments produces visibly wrong transcripts.
-5. **Auto speaker detection over-splits.** Short backchannels ("sí", "vale") get
+7. **Auto speaker detection over-splits.** Short backchannels ("sí", "vale") get
    assigned their own speaker. Pass `--speakers N` when the count is known.
 
 ---

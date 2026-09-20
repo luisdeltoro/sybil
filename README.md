@@ -118,14 +118,33 @@ and noisy recordings. Individual flags override the bundle.
 ## How it works
 
 1. **Audio extraction** — `ffmpeg` extracts 16 kHz mono WAV.
-2. **Denoising** — profile-dependent; applied only to the Whisper input.
+2. **Preflight** — the extracted audio is verified readable, and the pyannote
+   pipeline is loaded (validating your token and model licence) *before*
+   transcription starts, so those failures surface in seconds rather than after
+   a long transcription has already run.
+3. **Denoising** — profile-dependent; applied only to the Whisper input.
    Diarization always uses the **raw** audio, since denoising can distort
    speaker voiceprints.
-3. **Transcription** — Whisper produces word-level timestamps (when diarizing).
-4. **Diarization + alignment** — pyannote produces speaker turns; each word is
-   assigned to the overlapping turn, and consecutive same-speaker words are
-   merged into utterances. This splits speaker changes that occur *inside* a
-   Whisper segment. Speakers are numbered by first appearance.
+4. **Transcription** — Whisper produces word-level timestamps (when diarizing).
+5. **Diarization + alignment** — the raw audio is read into memory and passed to
+   pyannote as a waveform, not as a file path (see below). pyannote produces
+   speaker turns; each word is assigned to the overlapping turn, and consecutive
+   same-speaker words are merged into utterances. This splits speaker changes
+   that occur *inside* a Whisper segment. Speakers are numbered by first
+   appearance.
+
+### Why audio is passed to pyannote in memory
+
+pyannote accepts either a file path or a `{"waveform": ..., "sample_rate": ...}`
+mapping. Given a path, it decodes the file itself using **torchcodec**, which
+links FFmpeg's C libraries by exact version: torchcodec 0.13 requires
+`libavutil.56`–`60` (FFmpeg 4–8), so an upgrade to FFmpeg 9 — which ships
+`libavutil.61` — breaks diarization with `torchcodec is not available`.
+
+Since `ffmpeg` has already produced plain PCM in step 1, this tool reads that
+WAV with `soundfile` and hands pyannote the waveform directly. That keeps
+diarization working regardless of the installed FFmpeg version, and avoids
+decoding the same audio twice.
 
 ## Output format
 
@@ -163,6 +182,8 @@ case), and formatting. They do not load Whisper or pyannote.
 
 - Diarization memory and time scale with duration. For long recordings prefer
   `--profile clean` (no denoise pass) and a smaller `--whisper-model` if needed.
+- The raw audio is held in memory for diarization: roughly **3.8 MB per minute**
+  at 16 kHz mono float32, so about 215 MB for a 56-minute recording.
 - Very large source files (multi-GB video) work, but audio extraction and
   transcription dominate runtime; consider `--whisper-model small` first to
   validate output, then re-run with `medium`/`large` if desired.
@@ -173,6 +194,14 @@ case), and formatting. They do not load Whisper or pyannote.
   or use `--no-diarize`.
 - **"Failed to load pyannote pipeline"** — ensure you accepted the model
   conditions (see Setup) and the token has read access.
+- **"torchcodec is not available"** — this tool avoids torchcodec for
+  diarization, so you should not hit it there. If another library raises it
+  (for example anything going through `torchaudio.load`), your FFmpeg major
+  version is newer than torchcodec supports. Check with
+  `ffmpeg -version` and compare against
+  `ls .venv/lib/python3.12/site-packages/torchcodec/libtorchcodec_core*.dylib`
+  (one shim per supported FFmpeg major). Installing a supported FFmpeg
+  alongside, or upgrading torchcodec, are the options.
 - **Auto-detect finds too many speakers** — short backchannels ("sí", "vale")
   can be split off as extra speakers. Pass `--speakers N` to fix the count.
 - **Repeated words / hallucinations** — use `--profile clean` (greedy decoding).
