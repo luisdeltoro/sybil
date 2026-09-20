@@ -34,6 +34,7 @@ All commands run from the repo root.
 | CI-style gate (no rewriting) | `make check` |
 | Everything | `make all` |
 | Run the tool | `uv run extract-speech <file> [options]` |
+| Batch a folder | `uv run extract-speech --source DIR --target DIR` |
 
 Never invoke `pytest`, `ruff` or `pyright` directly — go through `make` (or
 `uv run`) so the correct environment is used.
@@ -54,9 +55,16 @@ Never invoke `pytest`, `ruff` or `pyright` directly — go through `make` (or
   `ConfigOverrides`, `Utterance`, `SpeakerTurn`.
 - **Errors:** raise `TranscriptionError` for external-step failures (ffmpeg,
   diarization). Do not swallow exceptions.
-- **Heavy imports** (`whisper`, `torch`, `pyannote`) are imported *inside* the
-  functions that need them, not at module top level. This keeps `--help` and the
-  test suite fast. Preserve this pattern.
+- **Heavy imports** (`whisper`, `torch`, `pyannote`, `demucs`) are imported
+  *inside* the functions that need them, not at module top level. This keeps
+  `--help` and the test suite fast. Preserve this pattern.
+- **Load models once, pass them in.** `load_whisper_model`,
+  `load_diarization_pipeline` and `load_demucs_model` are separate from the
+  functions that use them, so a batch loads weights once rather than per file.
+  `transcribe_to_text` takes a `LoadedModels` and never loads anything — keep it
+  that way, or batch mode silently regresses to per-file loading.
+- **Single-file and batch share one path** (`transcribe_to_text`). Do not add
+  batch-only behaviour that bypasses it.
 
 ---
 

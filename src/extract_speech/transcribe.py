@@ -412,7 +412,28 @@ def stem_index(sources: list[str], stem: str) -> int:
     return sources.index(stem)
 
 
-def denoise_demucs(inputs: AudioInputs, output_wav: Path, model_name: str = DEFAULT_DEMUCS_MODEL) -> None:
+def load_demucs_model(model_name: str = DEFAULT_DEMUCS_MODEL) -> Any:
+    """Load a Demucs model onto the best available device.
+
+    Separate from :func:`denoise_demucs` so a batch loads the 80 MB bag once
+    rather than once per file.
+
+    Raises:
+        TranscriptionError: If ``model_name`` is not an installed bag.
+    """
+    import torch
+    from demucs.pretrained import get_model
+
+    validate_demucs_model(model_name, available_demucs_models())
+    print(f"Loading Demucs model: {model_name}")
+    model = get_model(model_name)
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    model.to(device)
+    model.eval()
+    return model
+
+
+def denoise_demucs(model: Any, inputs: AudioInputs, output_wav: Path) -> None:
     """Isolate the vocal stem with Demucs and write it as 16 kHz mono.
 
     Unlike the filter-based methods this reads ``inputs.source`` rather than the
@@ -425,9 +446,8 @@ def denoise_demucs(inputs: AudioInputs, output_wav: Path, model_name: str = DEFA
     """
     import torch
     from demucs.apply import apply_model
-    from demucs.pretrained import get_model
 
-    validate_demucs_model(model_name, available_demucs_models())
+    device = next(model.parameters()).device
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
@@ -462,12 +482,6 @@ def denoise_demucs(inputs: AudioInputs, output_wav: Path, model_name: str = DEFA
                 f"Demucs needs {DEMUCS_CHANNELS} channels but got {waveform.shape[0]} from {demucs_in}."
             )
 
-        print(f"Loading Demucs model: {model_name}")
-        model = get_model(model_name)
-        device = "mps" if torch.backends.mps.is_available() else "cpu"
-        model.to(device)
-        model.eval()
-
         normalised, mean, std = normalise_for_demucs(waveform)
 
         print(f"Separating vocals on {device} (this is the slow step)...")
@@ -500,12 +514,41 @@ def denoise_demucs(inputs: AudioInputs, output_wav: Path, model_name: str = DEFA
         print("  Vocal isolation complete.")
 
 
+# Filter-based methods: uniform (inputs, output_wav) signature, no model needed.
 DENOISE_METHODS = {
     "loudnorm": denoise_loudnorm,
     "spectral": denoise_spectral,
     "ffmpeg": denoise_ffmpeg_filters,
-    "demucs": denoise_demucs,
 }
+
+# Source separation is deliberately not in that registry: it needs a loaded
+# model, so its signature differs. Both sets together form the valid choices.
+DEMUCS_METHOD = "demucs"
+ALL_DENOISE_METHODS = frozenset(DENOISE_METHODS) | {DEMUCS_METHOD}
+
+
+def apply_denoise(
+    method: str,
+    inputs: AudioInputs,
+    output_wav: Path,
+    demucs_model: Any = None,
+) -> None:
+    """Dispatch to the named denoise method.
+
+    Raises:
+        TranscriptionError: If the method is unknown, or Demucs was selected
+            without a loaded model.
+    """
+    if method == DEMUCS_METHOD:
+        if demucs_model is None:
+            raise TranscriptionError("Demucs denoising requires a loaded model.")
+        denoise_demucs(demucs_model, inputs, output_wav)
+        return
+    if method not in DENOISE_METHODS:
+        raise TranscriptionError(
+            f"Unknown denoise method {method!r}. Available: {', '.join(sorted(ALL_DENOISE_METHODS))}"
+        )
+    DENOISE_METHODS[method](inputs, output_wav)
 
 
 # ---------------------------------------------------------------------------
@@ -513,19 +556,26 @@ DENOISE_METHODS = {
 # ---------------------------------------------------------------------------
 
 
+def load_whisper_model(whisper_model: str) -> Any:
+    """Load a Whisper model.
+
+    Separate from :func:`transcribe_audio` so a batch loads the weights once
+    rather than once per file (medium takes ~6 s, large considerably longer).
+    """
+    import whisper
+
+    print(f"Loading Whisper model: {whisper_model}")
+    return whisper.load_model(whisper_model)
+
+
 def transcribe_audio(
+    model: Any,
     audio_path: Path,
-    whisper_model: str,
     language: str,
     config: TranscribeConfig,
     word_timestamps: bool,
 ) -> list[dict]:
-    """Transcribe audio with Whisper and return its segment dictionaries."""
-    import whisper
-
-    print(f"Loading Whisper model: {whisper_model}")
-    model = whisper.load_model(whisper_model)
-
+    """Transcribe audio with an already-loaded Whisper model."""
     print(
         f"Transcribing (language={language}, "
         f"condition_on_previous={config.condition_on_previous_text}, "
@@ -783,6 +833,115 @@ def format_diarized(utterances: list[Utterance]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Batch mode: folder in, folder out
+# ---------------------------------------------------------------------------
+
+# Containers ffmpeg can extract audio from. Lowercase and dotted; matching is
+# case-insensitive.
+MEDIA_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        # video
+        ".mp4",
+        ".mov",
+        ".avi",
+        ".mkv",
+        ".webm",
+        ".m4v",
+        ".mpg",
+        ".mpeg",
+        # audio
+        ".wav",
+        ".mp3",
+        ".m4a",
+        ".flac",
+        ".aac",
+        ".ogg",
+        ".opus",
+        ".wma",
+    }
+)
+
+TRANSCRIPT_SUFFIX = "_transcript.txt"
+
+
+def discover_inputs(source: Path) -> list[Path]:
+    """Find every media file under ``source``, recursively.
+
+    Returns:
+        Matching files sorted by path, so a batch is reproducible and progress
+        counters are stable between runs.
+
+    Raises:
+        TranscriptionError: If ``source`` is not an existing directory.
+    """
+    if not source.is_dir():
+        raise TranscriptionError(f"{source} is not a directory.")
+    return sorted(p for p in source.rglob("*") if p.is_file() and p.suffix.lower() in MEDIA_EXTENSIONS)
+
+
+def output_path_for(input_path: Path, source_root: Path, target_root: Path) -> Path:
+    """Map an input file to its transcript path under ``target_root``.
+
+    The directory structure below ``source_root`` is mirrored, because the same
+    filename can appear in several subdirectories (the Tapo corpus has
+    identical names under ``Bedroom/`` and ``Living Room/``); flattening would
+    silently overwrite one transcript with another.
+
+    Raises:
+        TranscriptionError: If ``input_path`` is not below ``source_root``.
+    """
+    try:
+        relative = input_path.relative_to(source_root)
+    except ValueError as exc:
+        raise TranscriptionError(f"{input_path} is outside the source directory {source_root}.") from exc
+    return target_root / relative.with_name(relative.stem + TRANSCRIPT_SUFFIX)
+
+
+def plan_batch(
+    inputs: list[Path],
+    source_root: Path,
+    target_root: Path,
+    overwrite: bool,
+) -> tuple[list[tuple[Path, Path]], list[Path]]:
+    """Pair each input with its output, separating work from what already exists.
+
+    Skipping completed files makes a long batch resumable: an interrupted run
+    can simply be repeated.
+
+    Returns:
+        ``(pending, skipped)`` where ``pending`` holds ``(input, output)`` pairs.
+    """
+    pending: list[tuple[Path, Path]] = []
+    skipped: list[Path] = []
+    for item in inputs:
+        destination = output_path_for(item, source_root, target_root)
+        if destination.exists() and not overwrite:
+            skipped.append(item)
+        else:
+            pending.append((item, destination))
+    return pending, skipped
+
+
+def format_batch_summary(succeeded: int, skipped: int, failed: list[tuple[str, str]]) -> str:
+    """Render the end-of-batch report.
+
+    Each failure is collapsed to a single line: ffmpeg and torch errors are
+    multi-line, and letting them through turns the summary of a large batch into
+    a wall of text. The full error was already printed when the file failed.
+    """
+    lines = [
+        "",
+        "=" * 60,
+        f"Batch complete: {succeeded} transcribed, {skipped} skipped, {len(failed)} failed",
+        "=" * 60,
+    ]
+    for name, reason in failed:
+        first_line = reason.strip().splitlines()[0] if reason.strip() else "unknown error"
+        lines.append(f"  FAILED  {name}: {first_line}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -815,7 +974,35 @@ acceptance of the model conditions at
 https://hf.co/pyannote/speaker-diarization-community-1
 """,
     )
-    parser.add_argument("input", type=Path, help="Video or audio file to process")
+    parser.add_argument(
+        "input",
+        type=Path,
+        nargs="?",
+        default=None,
+        help="Video or audio file to process (omit when using --source)",
+    )
+
+    # Batch mode
+    parser.add_argument(
+        "--source",
+        type=Path,
+        default=None,
+        help="Directory of media files to transcribe (recursive); requires --target",
+    )
+    parser.add_argument(
+        "--target",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for batch transcripts. The --source tree is mirrored and "
+            f"each file becomes <name>{TRANSCRIPT_SUFFIX}"
+        ),
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Re-transcribe files whose transcript already exists (default: skip them)",
+    )
 
     parser.add_argument(
         "--profile",
@@ -863,7 +1050,7 @@ https://hf.co/pyannote/speaker-diarization-community-1
     # Profile overrides
     parser.add_argument(
         "--denoise",
-        choices=list(DENOISE_METHODS),
+        choices=sorted(ALL_DENOISE_METHODS),
         default=None,
         help="Override denoise method (implies denoising ON)",
     )
@@ -963,13 +1150,166 @@ def _write_output(text: str, output: Path | None, header: str) -> None:
         print("=" * 60)
 
 
+@dataclass(frozen=True)
+class LoadedModels:
+    """Models loaded once and reused for every file in a run."""
+
+    whisper: Any
+    pipeline: Any = None  # pyannote; None when diarization is off
+    demucs: Any = None  # None unless Demucs denoising is selected
+
+
+def transcribe_to_text(
+    source: Path,
+    models: LoadedModels,
+    config: TranscribeConfig,
+    language: str,
+    speakers: int | None,
+) -> str:
+    """Run the full pipeline for one file and return the formatted transcript.
+
+    Shared by single-file and batch mode so both behave identically. Models are
+    passed in already loaded; this function never loads weights.
+
+    Raises:
+        TranscriptionError: If any external step fails.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        raw_wav = tmp / "raw_audio.wav"
+        clean_wav = tmp / "clean_audio.wav"
+
+        extract_audio(source, raw_wav)
+        inputs = AudioInputs(source=source, extracted=raw_wav)
+
+        # Reject unreadable or empty audio before any expensive work.
+        read_waveform(raw_wav)
+
+        if config.denoise_enabled:
+            apply_denoise(config.denoise_method, inputs, clean_wav, models.demucs)
+            whisper_input = clean_wav
+        else:
+            print("Denoising disabled (profile/override).")
+            whisper_input = raw_wav
+
+        segments = transcribe_audio(
+            models.whisper,
+            whisper_input,
+            language,
+            config,
+            word_timestamps=models.pipeline is not None,
+        )
+        if not segments:
+            return ""
+
+        if models.pipeline is None:
+            return format_plain(segments)
+
+        # Diarization uses the raw audio: denoising distorts voiceprints.
+        turns = run_diarization(models.pipeline, raw_wav, speakers)
+        if not turns:
+            print("Warning: no speakers detected; emitting plain transcript.", file=sys.stderr)
+            return format_plain(segments)
+
+        speaker_map = build_speaker_map(turns)
+        utterances = group_words_by_speaker(segments, turns, speaker_map)
+        print(f"\nDetected {len(speaker_map)} speaker(s).")
+        return format_diarized(utterances)
+
+
+def _load_models(args: argparse.Namespace, config: TranscribeConfig, hf_token: str) -> LoadedModels:
+    """Load every model the run needs, before any transcription starts.
+
+    Loading first means a bad token, an unaccepted model licence or a mistyped
+    Demucs model surfaces in seconds rather than after hours of transcription.
+    """
+    demucs_model = (
+        load_demucs_model(args.demucs_model)
+        if config.denoise_enabled and config.denoise_method == DEMUCS_METHOD
+        else None
+    )
+    pipeline = load_diarization_pipeline(hf_token) if args.diarize else None
+    return LoadedModels(
+        whisper=load_whisper_model(args.whisper_model),
+        pipeline=pipeline,
+        demucs=demucs_model,
+    )
+
+
+def _run_single(args: argparse.Namespace, config: TranscribeConfig, hf_token: str) -> int:
+    """Transcribe one file. Returns a process exit code."""
+    models = _load_models(args, config, hf_token)
+    text = transcribe_to_text(args.input, models, config, args.language, args.speakers)
+    if not text:
+        print("No speech detected in the audio.")
+        return 0
+    header = "DIARIZED TRANSCRIPT" if models.pipeline is not None else "TRANSCRIPT"
+    _write_output(text, args.output, header)
+    return 0
+
+
+def _run_batch(args: argparse.Namespace, config: TranscribeConfig, hf_token: str) -> int:
+    """Transcribe every media file under --source into --target.
+
+    A failure on one file is reported and the batch continues: one unreadable
+    recording should not discard the work already done on the others.
+    """
+    inputs = discover_inputs(args.source)
+    if not inputs:
+        print(f"No media files found under {args.source}")
+        print(f"Recognised extensions: {', '.join(sorted(MEDIA_EXTENSIONS))}")
+        return 0
+
+    pending, skipped = plan_batch(inputs, args.source, args.target, args.overwrite)
+    print(f"Found {len(inputs)} media file(s): {len(pending)} to transcribe, {len(skipped)} already done.")
+    for item in skipped:
+        print(f"  SKIP  {item.relative_to(args.source)} (transcript exists; --overwrite to redo)")
+    if not pending:
+        return 0
+
+    models = _load_models(args, config, hf_token)
+
+    succeeded = 0
+    failed: list[tuple[str, str]] = []
+    for index, (source, destination) in enumerate(pending, start=1):
+        relative = source.relative_to(args.source)
+        print(f"\n[{index}/{len(pending)}] {relative}")
+        try:
+            text = transcribe_to_text(source, models, config, args.language, args.speakers)
+        except TranscriptionError as exc:
+            print(f"  FAILED: {exc}", file=sys.stderr)
+            failed.append((str(relative), str(exc)))
+            continue
+        if not text:
+            print("  No speech detected; writing an empty transcript.")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(text, encoding="utf-8")
+        print(f"  -> {destination.relative_to(args.target)}")
+        succeeded += 1
+
+    print(format_batch_summary(succeeded, len(skipped), failed))
+    return 1 if failed else 0
+
+
 def main() -> None:
     load_dotenv()
     args = build_parser().parse_args()
 
-    if not args.input.exists():
+    batch = args.source is not None
+    if batch:
+        if args.target is None:
+            print("Error: --target is required with --source", file=sys.stderr)
+            sys.exit(1)
+        if args.output is not None:
+            print("Error: --output applies to a single file; use --target with --source", file=sys.stderr)
+            sys.exit(1)
+    elif args.input is None:
+        print("Error: provide an input file, or --source and --target for a folder", file=sys.stderr)
+        sys.exit(1)
+    elif not args.input.exists():
         print(f"Error: File not found: {args.input}", file=sys.stderr)
         sys.exit(1)
+
     if args.speakers is not None and args.speakers < 1:
         print("Error: --speakers must be >= 1", file=sys.stderr)
         sys.exit(1)
@@ -981,66 +1321,7 @@ def main() -> None:
     hf_token = resolve_hf_token(args.hf_token) if args.diarize else ""
 
     try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
-            raw_wav = tmp / "raw_audio.wav"
-            clean_wav = tmp / "clean_audio.wav"
-
-            # Step 1: extract audio
-            extract_audio(args.input, raw_wav)
-            audio_inputs = AudioInputs(source=args.input, extracted=raw_wav)
-
-            # Fail fast: verify the extracted audio is readable and non-empty,
-            # and load the diarization pipeline (which validates the token and
-            # the model licence) *before* transcription. Transcribing a long
-            # recording takes tens of minutes, so a problem that is knowable
-            # now should not surface only after that work is thrown away.
-            read_waveform(raw_wav)
-            if config.denoise_enabled and config.denoise_method == "demucs":
-                validate_demucs_model(args.demucs_model, available_demucs_models())
-            pipeline = load_diarization_pipeline(hf_token) if args.diarize else None
-
-            # Step 2: denoise (Whisper input only; diarization uses raw audio)
-            if config.denoise_enabled:
-                if config.denoise_method == "demucs":
-                    denoise_demucs(audio_inputs, clean_wav, args.demucs_model)
-                else:
-                    DENOISE_METHODS[config.denoise_method](audio_inputs, clean_wav)
-                whisper_input = clean_wav
-            else:
-                print("Denoising disabled (profile/override).")
-                whisper_input = raw_wav
-
-            # Step 3: transcribe
-            segments = transcribe_audio(
-                whisper_input,
-                args.whisper_model,
-                args.language,
-                config,
-                word_timestamps=args.diarize,
-            )
-
-            if not segments:
-                print("No speech detected in the audio.")
-                sys.exit(0)
-
-            # Step 4: diarize + align (optional)
-            if pipeline is not None:
-                turns = run_diarization(pipeline, raw_wav, args.speakers)
-                if not turns:
-                    print(
-                        "Warning: no speakers detected; emitting plain transcript.",
-                        file=sys.stderr,
-                    )
-                    _write_output(format_plain(segments), args.output, "TRANSCRIPT")
-                    return
-                speaker_map = build_speaker_map(turns)
-                utterances = group_words_by_speaker(segments, turns, speaker_map)
-                print(f"\nDetected {len(speaker_map)} speaker(s).")
-                _write_output(format_diarized(utterances), args.output, "DIARIZED TRANSCRIPT")
-            else:
-                _write_output(format_plain(segments), args.output, "TRANSCRIPT")
-
+        sys.exit(_run_batch(args, config, hf_token) if batch else _run_single(args, config, hf_token))
     except TranscriptionError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)

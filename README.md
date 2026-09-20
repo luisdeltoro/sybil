@@ -59,6 +59,32 @@ If you only want a plain transcript, use `--no-diarize` and no token is needed.
 
 ## Usage
 
+### Batch: a folder in, a folder out
+
+```bash
+uv run extract-speech --source ~/Downloads/Tapo --target ~/transcripts --profile noisy
+```
+
+The `--source` tree is searched recursively and its structure mirrored into
+`--target`, with each file becoming `<name>_transcript.txt`:
+
+```
+Tapo/20260522/Living Room/1779486332469_0.mp4
+  -> transcripts/20260522/Living Room/1779486332469_0_transcript.txt
+```
+
+Mirroring matters: the same filename can appear under several subdirectories, so
+flattening would silently overwrite one transcript with another.
+
+- Files whose transcript already exists are **skipped**, so an interrupted batch
+  can simply be re-run. `--overwrite` forces a redo.
+- Models are loaded **once** for the whole batch, not per file.
+- A file that fails is reported and the batch **continues**; the summary lists
+  every failure and the exit code is non-zero if there was any.
+- Non-media files are ignored.
+
+### Single file
+
 ```bash
 # Clean phone call, diarized, Spanish — all defaults
 uv run extract-speech conversation.mp4
@@ -78,7 +104,10 @@ uv run extract-speech talk.mp4 --no-diarize --whisper-model large --language en
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `input` | (required) | Path to the video or audio file |
+| `input` | — | Path to a single video or audio file (omit when using `--source`) |
+| `--source` | — | Directory to transcribe recursively; requires `--target` |
+| `--target` | — | Output directory for batch mode; mirrors the `--source` tree |
+| `--overwrite` | off | Re-transcribe files that already have a transcript |
 | `--profile` | `clean` | Knob bundle: `clean` or `noisy` (see below) |
 | `--whisper-model` (alias `--model`) | `medium` | `tiny`, `base`, `small`, `medium`, `large` |
 | `--language` | `es` | Language code (`es`, `en`, `fr`, `de`, …) |

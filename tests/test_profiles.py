@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from extract_speech.transcribe import (
-    DENOISE_METHODS,
+    ALL_DENOISE_METHODS,
     PROFILES,
     ConfigOverrides,
     build_parser,
@@ -43,13 +43,19 @@ def test_noisy_profile_defaults():
     assert cfg.best_of == 5
 
 
-def test_all_denoise_methods_are_registered():
-    assert set(DENOISE_METHODS) == {"loudnorm", "spectral", "ffmpeg", "demucs"}
+def test_all_denoise_methods_are_selectable():
+    assert set(ALL_DENOISE_METHODS) == {"loudnorm", "spectral", "ffmpeg", "demucs"}
 
 
 def test_every_profile_names_a_real_denoise_method():
     for name, cfg in PROFILES.items():
-        assert cfg.denoise_method in DENOISE_METHODS, name
+        assert cfg.denoise_method in ALL_DENOISE_METHODS, name
+
+
+def test_cli_denoise_choices_match_the_registry():
+    # A method that exists but is not offered on the CLI is unreachable.
+    action = next(a for a in build_parser()._actions if a.dest == "denoise")
+    assert set(action.choices or []) == set(ALL_DENOISE_METHODS)
 
 
 def test_unknown_profile_raises():
